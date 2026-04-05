@@ -1,0 +1,7 @@
+/* styles.css — Injected into every page for word-level highlighting.
+   Uses the CSS Custom Highlight API (Chrome 105+). */
+
+::highlight(tts-word) {
+  background-color: #ffeb3b;
+  color: #000;
+}

@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Japanese TTS Reader",
+  "version": "1.0.0",
+  "description": "Read Japanese articles aloud with word-level highlighting using Google Cloud TTS",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://texttospeech.googleapis.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Japanese TTS Reader"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-reading": {
+      "suggested_key": { "default": "Alt+R" },
+      "description": "Start or pause reading"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>🔊 TTS Reader</h1>
+
+    <div class="controls">
+      <button id="readBtn" title="Read aloud (Alt+R)">▶ Read</button>
+      <button id="pauseBtn" title="Pause / Resume" disabled>⏸</button>
+      <button id="stopBtn" title="Stop" disabled>⏹</button>
+    </div>
+
+    <div class="speed-row">
+      <label for="speedSlider">Speed&nbsp;<span id="speedVal">1.0</span>x</label>
+      <input type="range" id="speedSlider" min="0.5" max="2.0" step="0.1" value="1.0">
+    </div>
+
+    <div id="status" class="status">Ready</div>
+
+    <details class="settings">
+      <summary>⚙ Settings</summary>
+
+      <div class="field">
+        <label for="apiKey">GCP API Key</label>
+        <div class="input-row">
+          <input type="password" id="apiKey" placeholder="Enter your API key" autocomplete="off">
+          <button id="saveKey" title="Save key">💾</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="voice">Voice</label>
+        <select id="voice">
+          <option value="ja-JP-Neural2-B" selected>Neural2-B (Female)</option>
+          <option value="ja-JP-Neural2-C">Neural2-C (Male)</option>
+          <option value="ja-JP-Neural2-D">Neural2-D (Female)</option>
+          <option value="ja-JP-Wavenet-A">Wavenet-A (Female)</option>
+          <option value="ja-JP-Wavenet-B">Wavenet-B (Female)</option>
+          <option value="ja-JP-Wavenet-D">Wavenet-D (Male)</option>
+        </select>
+      </div>
+
+      <button id="clearCache" class="link-btn">Clear audio cache</button>
+    </details>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
