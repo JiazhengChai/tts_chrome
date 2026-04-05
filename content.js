@@ -21,8 +21,14 @@
     rafId: null,
     activeWordKey: null,
     speed: 1.0,
-    voice: 'ja-JP-Neural2-B'
+    voice: 'ja-JP-Neural2-B',
+    segmentLanguage: 'ja'
   };
+
+  function getVoiceLanguageCode(voice) {
+    const match = /^([a-z]{2,3})-[A-Z]{2}/.exec(voice || '');
+    return match ? match[1] : 'ja';
+  }
 
   // ═══════════════════ CSS Custom Highlight ═══════════════════
 
@@ -108,7 +114,7 @@
     }
 
     const nodes = textNodesUnder(root);
-    const segmenter = new Intl.Segmenter('ja', { granularity: 'word' });
+    const segmenter = new Intl.Segmenter(state.segmentLanguage, { granularity: 'word' });
     const words = [];
 
     const selRange = hasSelection ? sel.getRangeAt(0) : null;
@@ -273,6 +279,7 @@
     const prefs = await chrome.storage.sync.get(['voice', 'speed']);
     if (prefs.voice) state.voice = prefs.voice;
     if (prefs.speed) state.speed = prefs.speed;
+    state.segmentLanguage = getVoiceLanguageCode(state.voice);
 
     const extracted = extractWords();
     const words = extracted.words;

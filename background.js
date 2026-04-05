@@ -11,6 +11,11 @@ function isSupportedUrl(url) {
   return typeof url === 'string' && /^https?:\/\//.test(url);
 }
 
+function getVoiceLanguageCode(voice) {
+  const match = /^([a-z]{2,3}-[A-Z]{2})/.exec(voice || '');
+  return match ? match[1] : 'ja-JP';
+}
+
 async function setTargetTab(tabId) {
   if (!tabId) return;
 
@@ -147,7 +152,7 @@ async function synthesize(ssml, apiKey, voice) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         input: { ssml },
-        voice: { languageCode: voice.slice(0, 5), name: voice },
+        voice: { languageCode: getVoiceLanguageCode(voice), name: voice },
         audioConfig: { audioEncoding: 'MP3' },
         enableTimePointing: ['SSML_MARK']
       })
