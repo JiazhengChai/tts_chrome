@@ -13,8 +13,13 @@
     paused: false,
     audio: null,
     chunks: [],       // [{ text, words, audioContent }]
+    preparedKey: null,
+    preparedAssets: new Map(),
     chunkIndex: 0,
+    startChunkIndex: 0,
+    startWordIndex: 0,
     rafId: null,
+    activeWordKey: null,
     speed: 1.0,
     voice: 'ja-JP-Neural2-B'
   };
@@ -106,36 +111,33 @@
     const segmenter = new Intl.Segmenter('ja', { granularity: 'word' });
     const words = [];
 
-    let started = !hasSelection;
     const selRange = hasSelection ? sel.getRangeAt(0) : null;
+    const selPoint = hasSelection ? document.createRange() : null;
+    let startWordIndex = 0;
+    let foundStart = !hasSelection;
+
+    if (selPoint) {
+      selPoint.setStart(selRange.startContainer, selRange.startOffset);
+      selPoint.collapse(true);
+    }
 
     for (const node of nodes) {
-      // Skip nodes before the selection start
-      if (!started) {
-        if (node === selRange.startContainer) {
-          started = true;
-          // For this node, skip segments entirely before selection offset
-          const startOff = selRange.startOffset;
-          for (const seg of segmenter.segment(node.textContent)) {
-            if (seg.index + seg.segment.length <= startOff) continue;
-            pushWord(words, node, seg);
-          }
-          continue;
-        }
-        // Check if this node is a descendant of the selection start container
-        if (selRange.startContainer.contains?.(node)) {
-          started = true;
-        } else {
-          continue;
-        }
-      }
-
       for (const seg of segmenter.segment(node.textContent)) {
-        pushWord(words, node, seg);
+        const word = pushWord(words, node, seg);
+        if (!word || foundStart || !selPoint) continue;
+
+        // First segment whose end falls after the selection start.
+        if (word.range.compareBoundaryPoints(Range.END_TO_START, selPoint) > 0) {
+          startWordIndex = word.globalIndex;
+          foundStart = true;
+        }
       }
     }
 
-    return words;
+    return {
+      words,
+      startWordIndex: words.length > 0 ? Math.min(startWordIndex, words.length - 1) : 0
+    };
   }
 
   function pushWord(words, node, seg) {
@@ -143,12 +145,16 @@
       const r = document.createRange();
       r.setStart(node, seg.index);
       r.setEnd(node, seg.index + seg.segment.length);
-      words.push({
+      const word = {
         text: seg.segment,
         isWordLike: seg.isWordLike,
-        range: r
-      });
+        range: r,
+        globalIndex: words.length
+      };
+      words.push(word);
+      return word;
     } catch { /* invalid offset — skip */ }
+    return null;
   }
 
   // ═══════════════════ Chunking ═══════════════════
@@ -158,44 +164,97 @@
     return new TextEncoder().encode(s).byteLength;
   }
 
+  function escapeSsml(text) {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+
   /** Split words into chunks whose text stays under `limit` UTF-8 bytes.
-   *  GCP TTS hard-limits input to 5000 bytes; we use 4800 for safety. */
+   *  GCP TTS hard-limits SSML input to 5000 bytes; we use 4700 for safety. */
   function makeChunks(words, limitBytes = 4800) {
+    const speakOpen = '<speak>';
+    const speakClose = '</speak>';
     const chunks = [];
-    let buf = { text: '', words: [], bytes: 0 };
+    let markIndex = 0;
+    let buf = {
+      text: '',
+      words: [],
+      parts: [],
+      bytes: byteLen(speakOpen) + byteLen(speakClose)
+    };
 
     for (const w of words) {
-      const wb = byteLen(w.text);
-      if (buf.bytes + wb > limitBytes && buf.text.length > 0) {
+      const markName = w.isWordLike ? `w${markIndex++}` : null;
+      const escaped = escapeSsml(w.text);
+      const markup = markName ? `<mark name="${markName}"/>${escaped}` : escaped;
+      const markupBytes = byteLen(markup);
+
+      if (buf.bytes + markupBytes > limitBytes && buf.text.length > 0) {
+        buf.ssml = `${speakOpen}${buf.parts.join('')}${speakClose}`;
+        buf.memoryKey = `${state.voice}|${buf.ssml}`;
         chunks.push(buf);
-        buf = { text: '', words: [], bytes: 0 };
+        buf = {
+          text: '',
+          words: [],
+          parts: [],
+          bytes: byteLen(speakOpen) + byteLen(speakClose)
+        };
       }
+
+      const chunkWord = { ...w, markName };
       buf.text += w.text;
-      buf.words.push(w);
-      buf.bytes += wb;
+      buf.words.push(chunkWord);
+      buf.parts.push(markup);
+      buf.bytes += markupBytes;
     }
-    if (buf.text.length > 0) chunks.push(buf);
+
+    if (buf.text.length > 0) {
+      buf.ssml = `${speakOpen}${buf.parts.join('')}${speakClose}`;
+      buf.memoryKey = `${state.voice}|${buf.ssml}`;
+      chunks.push(buf);
+    }
+
     return chunks;
   }
 
   // ═══════════════════ Timing estimation ═══════════════════
 
-  function assignTimings(words, duration) {
-    let totalWeight = 0;
-    for (const w of words) {
-      // Word-like segments get full weight; punctuation/whitespace get a fraction
-      w.weight = w.isWordLike ? Math.max(w.text.length, 1) : w.text.length * 0.15;
-      totalWeight += w.weight;
-    }
-    if (totalWeight === 0) return;
+  function applyTimepoints(chunk, duration) {
+    const marks = chunk.words.filter(w => w.markName);
+    const starts = new Map((chunk.timepoints || []).map(tp => [tp.markName, tp.timeSeconds]));
 
-    let t = 0;
-    for (const w of words) {
-      w.startTime = t;
-      w.dur = duration * (w.weight / totalWeight);
-      w.endTime = t + w.dur;
-      t = w.endTime;
+    for (let i = 0; i < marks.length; i++) {
+      const word = marks[i];
+      const startTime = starts.get(word.markName);
+      const nextStart = i + 1 < marks.length ? starts.get(marks[i + 1].markName) : duration;
+
+      if (typeof startTime !== 'number') continue;
+
+      word.startTime = startTime;
+      word.endTime = typeof nextStart === 'number' && nextStart > startTime
+        ? nextStart
+        : Math.min(duration, startTime + 0.35);
     }
+  }
+
+  function findPlaybackStart(chunks, startWordIndex) {
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+      const wordIndex = chunks[chunkIndex].words.findIndex(word => word.globalIndex >= startWordIndex);
+      if (wordIndex !== -1) {
+        return { chunkIndex, wordIndex };
+      }
+    }
+
+    return { chunkIndex: 0, wordIndex: 0 };
+  }
+
+  function findSeekTime(chunk, startWordIndex) {
+    const startWord = chunk.words.find(word => word.globalIndex >= startWordIndex && typeof word.startTime === 'number');
+    return startWord ? startWord.startTime : 0;
   }
 
   // ═══════════════════ Audio playback ═══════════════════
@@ -215,24 +274,51 @@
     if (prefs.voice) state.voice = prefs.voice;
     if (prefs.speed) state.speed = prefs.speed;
 
-    const words = extractWords();
+    const extracted = extractWords();
+    const words = extracted.words;
     if (words.length === 0) {
       notify('error', 'No readable text found on this page.');
       return;
     }
 
     const chunks = makeChunks(words);
+    const preparedKey = chunks.map(chunk => chunk.memoryKey).join('|');
+    const playbackStart = findPlaybackStart(chunks, extracted.startWordIndex);
+
+    for (const chunk of chunks) {
+      const cached = state.preparedAssets.get(chunk.memoryKey);
+      if (cached) {
+        chunk.audioContent = cached.audioContent;
+        chunk.timepoints = cached.timepoints || [];
+      }
+    }
+
     state.chunks = chunks;
-    state.chunkIndex = 0;
+    state.preparedKey = preparedKey;
+    state.chunkIndex = playbackStart.chunkIndex;
+    state.startChunkIndex = playbackStart.chunkIndex;
+    state.startWordIndex = extracted.startWordIndex;
     state.playing = true;
     state.paused = false;
 
-    notify('loading', `Synthesizing ${chunks.length} chunk(s)…`);
+    const missingChunks = chunks.filter(chunk => !chunk.audioContent);
+
+    if (missingChunks.length === 0) {
+      notify('playing', 'Reading from cache…');
+      playNextChunk();
+      return;
+    }
+
+    notify('loading', `Synthesizing ${missingChunks.length} chunk(s)…`);
 
     try {
       const resp = await chrome.runtime.sendMessage({
         action: 'synthesize',
-        chunks: chunks.map((c, i) => ({ text: c.text, index: i })),
+        chunks: missingChunks.map(chunk => ({
+          text: chunk.text,
+          ssml: chunk.ssml,
+          index: chunks.indexOf(chunk)
+        })),
         voice: state.voice,
         url: location.href
       });
@@ -243,6 +329,11 @@
       // Attach audio data
       for (const r of resp.results) {
         chunks[r.chunkIndex].audioContent = r.audioContent;
+        chunks[r.chunkIndex].timepoints = r.timepoints || [];
+        state.preparedAssets.set(chunks[r.chunkIndex].memoryKey, {
+          audioContent: r.audioContent,
+          timepoints: r.timepoints || []
+        });
       }
 
       notify('playing', 'Reading…');
@@ -268,7 +359,10 @@
     state.audio = audio;
 
     audio.addEventListener('loadedmetadata', () => {
-      assignTimings(chunk.words, audio.duration);
+      applyTimepoints(chunk, audio.duration);
+      if (state.chunkIndex === state.startChunkIndex) {
+        audio.currentTime = findSeekTime(chunk, state.startWordIndex);
+      }
       audio.play();
       runHighlightLoop(chunk);
     });
@@ -292,12 +386,14 @@
   // ═══════════════════ Highlight sync ═══════════════════
 
   function runHighlightLoop(chunk) {
+    const markedWords = chunk.words.filter(w => typeof w.startTime === 'number');
+
     const step = () => {
       if (!state.playing || state.paused || !state.audio) return;
       const t = state.audio.currentTime;
 
-      for (const w of chunk.words) {
-        if (w.isWordLike && t >= w.startTime && t < w.endTime) {
+      for (const w of markedWords) {
+        if (t >= w.startTime && t < w.endTime) {
           applyHighlight(w);
           break;
         }
@@ -309,6 +405,10 @@
 
   function applyHighlight(word) {
     if (!wordHL) return;
+    const wordKey = `${state.chunkIndex}:${word.markName}:${word.startTime}`;
+    if (state.activeWordKey === wordKey) return;
+
+    state.activeWordKey = wordKey;
     wordHL.clear();
     try {
       wordHL.add(word.range);
@@ -347,6 +447,9 @@
       state.audio = null;
     }
     cancelAnimationFrame(state.rafId);
+    state.activeWordKey = null;
+    state.startChunkIndex = 0;
+    state.startWordIndex = 0;
     if (wordHL) wordHL.clear();
     if (wasPlaying) notify('ready', 'Ready');
   }

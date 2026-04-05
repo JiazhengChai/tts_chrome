@@ -1,6 +1,17 @@
 /* popup.js — Extension popup logic */
 
 const $ = id => document.getElementById(id);
+const query = new URLSearchParams(location.search);
+const isDetachedMode = query.get('detached') === '1';
+const isPipMode = query.get('pip') === '1';
+
+if (isDetachedMode) {
+  document.body.classList.add('detached');
+}
+
+if (isPipMode) {
+  document.body.classList.add('pip');
+}
 
 // ── Load saved settings ──
 
@@ -13,15 +24,19 @@ chrome.storage.sync.get(['apiKey', 'voice', 'speed'], data => {
   }
 });
 
+seedTargetTab().catch(() => {});
+
 // ── Query current playback state from content script ──
 
 (async () => {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) return;
-    const state = await chrome.tabs.sendMessage(tab.id, { action: 'getState' });
+    const target = await getTargetTab();
+    if (!target?.tabId) return;
+    const state = await ensureContentScriptAndSend(target.tabId, { action: 'getState' });
     if (state) updateButtons(state);
-  } catch { /* content script not injected yet */ }
+  } catch (e) {
+    $('status').textContent = '⚠ ' + e.message;
+  }
 })();
 
 function updateButtons(st) {
@@ -35,21 +50,43 @@ function updateButtons(st) {
 
 // ── Helpers ──
 
-async function sendToTab(msg) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) throw new Error('No active tab');
-
-  if (!isSupportedTab(tab)) {
-    throw new Error('Open a normal web page first. Chrome internal pages are not supported.');
+async function getTargetTab() {
+  const target = await chrome.runtime.sendMessage({ action: 'getTargetTab' });
+  if (target?.error) {
+    throw new Error(target.error);
   }
-
-  await ensureContentScript(tab.id);
-  return chrome.tabs.sendMessage(tab.id, msg);
+  if (!target?.tabId) {
+    throw new Error('Open a normal web page first.');
+  }
+  return target;
 }
 
-function isSupportedTab(tab) {
-  const url = tab?.url || '';
-  return /^https?:\/\//.test(url);
+async function seedTargetTab() {
+  if (isDetachedMode || isPipMode) {
+    return;
+  }
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id || !/^https?:\/\//.test(tab.url || '')) {
+    return;
+  }
+
+  await chrome.runtime.sendMessage({ action: 'setTargetTab', tabId: tab.id });
+}
+
+async function getSourceTabIdForDetach() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id && /^https?:\/\//.test(tab.url || '')) {
+    return tab.id;
+  }
+
+  const target = await chrome.runtime.sendMessage({ action: 'getTargetTab' });
+  return target?.tabId || null;
+}
+
+async function sendToTab(msg) {
+  const target = await getTargetTab();
+  return ensureContentScriptAndSend(target.tabId, msg);
 }
 
 async function ensureContentScript(tabId) {
@@ -70,6 +107,11 @@ async function ensureContentScript(tabId) {
     target: { tabId },
     files: ['content.js']
   });
+}
+
+async function ensureContentScriptAndSend(tabId, msg) {
+  await ensureContentScript(tabId);
+  return chrome.tabs.sendMessage(tabId, msg);
 }
 
 // ── Button handlers ──
@@ -135,6 +177,54 @@ $('clearCache').addEventListener('click', () => {
   chrome.runtime.sendMessage({ action: 'clearCache' });
   $('status').textContent = '✓ Cache cleared';
 });
+
+$('detachBtn').addEventListener('click', async () => {
+  const sourceTabId = await getSourceTabIdForDetach();
+  const resp = await chrome.runtime.sendMessage({ action: 'openDetachedController', sourceTabId });
+  if (resp?.error) {
+    $('status').textContent = '⚠ ' + resp.error;
+  }
+});
+
+if (isDetachedMode && !isPipMode) {
+  $('pinBtn').addEventListener('click', async () => {
+    try {
+      await openPinnedController();
+      $('status').textContent = 'Pinned controller opened';
+    } catch (e) {
+      $('status').textContent = '⚠ ' + e.message;
+    }
+  });
+}
+
+async function openPinnedController() {
+  if (!('documentPictureInPicture' in window)) {
+    throw new Error('Always-on-top mode is not supported in this Chrome version.');
+  }
+
+  if (window.documentPictureInPicture.window) {
+    window.documentPictureInPicture.window.focus();
+    return;
+  }
+
+  const pipWindow = await window.documentPictureInPicture.requestWindow({
+    width: 380,
+    height: 360
+  });
+
+  pipWindow.document.title = 'TTS Reader';
+  pipWindow.document.body.style.margin = '0';
+  pipWindow.document.body.style.background = '#fff';
+
+  const iframe = pipWindow.document.createElement('iframe');
+  iframe.src = chrome.runtime.getURL('popup.html?pip=1');
+  iframe.style.width = '100%';
+  iframe.style.height = '100%';
+  iframe.style.border = '0';
+  iframe.allow = 'clipboard-read; clipboard-write';
+
+  pipWindow.document.body.replaceChildren(iframe);
+}
 
 // ── Listen for status updates from content script ──
 

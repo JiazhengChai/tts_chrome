@@ -3,6 +3,93 @@
 const DB_NAME = 'tts_cache';
 const DB_VER = 1;
 const STORE = 'audio';
+const DETACHED_CONTROLLER_URL = chrome.runtime.getURL('popup.html?detached=1');
+
+let targetTabId = null;
+
+function isSupportedUrl(url) {
+  return typeof url === 'string' && /^https?:\/\//.test(url);
+}
+
+async function setTargetTab(tabId) {
+  if (!tabId) return;
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (isSupportedUrl(tab.url)) {
+      targetTabId = tab.id;
+    }
+  } catch {
+    if (targetTabId === tabId) {
+      targetTabId = null;
+    }
+  }
+}
+
+async function resolveTargetTab() {
+  if (targetTabId) {
+    try {
+      const tab = await chrome.tabs.get(targetTabId);
+      if (isSupportedUrl(tab.url)) {
+        return tab;
+      }
+    } catch {
+      targetTabId = null;
+    }
+  }
+
+  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const fallback = tabs.find(tab => isSupportedUrl(tab.url));
+  if (fallback?.id) {
+    targetTabId = fallback.id;
+    return fallback;
+  }
+
+  return null;
+}
+
+async function openDetachedController(sourceTabId) {
+  if (sourceTabId) {
+    await setTargetTab(sourceTabId);
+  }
+
+  const matches = await chrome.tabs.query({ url: DETACHED_CONTROLLER_URL });
+  const existing = matches[0];
+
+  if (existing?.windowId) {
+    await chrome.windows.update(existing.windowId, { focused: true });
+    if (existing.id) {
+      await chrome.tabs.update(existing.id, { active: true });
+    }
+    return { ok: true, reused: true };
+  }
+
+  await chrome.windows.create({
+    url: DETACHED_CONTROLLER_URL,
+    type: 'popup',
+    width: 380,
+    height: 360,
+    focused: true
+  });
+
+  return { ok: true, reused: false };
+}
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  setTargetTab(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tab.active && changeInfo.status === 'complete' && isSupportedUrl(tab.url)) {
+    targetTabId = tabId;
+  }
+});
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  if (targetTabId === tabId) {
+    targetTabId = null;
+  }
+});
 
 // ── IndexedDB helpers ──
 
@@ -52,16 +139,17 @@ async function sha256(text) {
 
 // ── GCP TTS API ──
 
-async function synthesize(text, apiKey, voice) {
+async function synthesize(ssml, apiKey, voice) {
   const res = await fetch(
-    `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`,
+    `https://texttospeech.googleapis.com/v1beta1/text:synthesize?key=${apiKey}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        input: { text },
+        input: { ssml },
         voice: { languageCode: voice.slice(0, 5), name: voice },
-        audioConfig: { audioEncoding: 'MP3' }
+        audioConfig: { audioEncoding: 'MP3' },
+        enableTimePointing: ['SSML_MARK']
       })
     }
   );
@@ -69,12 +157,33 @@ async function synthesize(text, apiKey, voice) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error?.message || `TTS API error (${res.status})`);
   }
-  return res.json(); // { audioContent: "base64..." }
+  return res.json();
 }
 
 // ── Message handler ──
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.action === 'setTargetTab') {
+    setTargetTab(msg.tabId)
+      .then(() => sendResponse({ ok: true, tabId: targetTabId }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  if (msg.action === 'openDetachedController') {
+    openDetachedController(msg.sourceTabId)
+      .then(sendResponse)
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  if (msg.action === 'getTargetTab') {
+    resolveTargetTab()
+      .then(tab => sendResponse(tab ? { tabId: tab.id, url: tab.url, title: tab.title } : { error: 'Open a normal web page first.' }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
   if (msg.action === 'synthesize') {
     handleSynthesize(msg)
       .then(sendResponse)
@@ -99,28 +208,36 @@ async function handleSynthesize({ chunks, voice, url }) {
   const results = [];
 
   for (const chunk of chunks) {
-    const cacheKey = await sha256(chunk.text + '|' + voice);
+    const cacheKey = await sha256(`v3|${voice}|${chunk.ssml}`);
 
-    // Check cache
     const cached = await dbGet(db, cacheKey);
-    if (cached) {
-      results.push({ audioContent: cached.audioContent, chunkIndex: chunk.index });
+    if (cached?.audioContent) {
+      results.push({
+        audioContent: cached.audioContent,
+        timepoints: cached.timepoints || [],
+        chunkIndex: chunk.index,
+        cached: true
+      });
       continue;
     }
 
-    // Call API
-    const data = await synthesize(chunk.text, apiKey, voice);
+    const data = await synthesize(chunk.ssml, apiKey, voice);
 
-    // Store in cache
     await dbPut(db, {
       key: cacheKey,
       audioContent: data.audioContent,
+      timepoints: data.timepoints || [],
       voice,
       url,
       ts: Date.now()
     });
 
-    results.push({ audioContent: data.audioContent, chunkIndex: chunk.index });
+    results.push({
+      audioContent: data.audioContent,
+      timepoints: data.timepoints || [],
+      chunkIndex: chunk.index,
+      cached: false
+    });
   }
 
   return { results };

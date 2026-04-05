@@ -12,6 +12,16 @@ body {
   background: #fff;
 }
 
+body.detached {
+  width: auto;
+  min-width: 360px;
+}
+
+body.pip {
+  width: auto;
+  min-width: 360px;
+}
+
 .container {
   padding: 16px;
 }
@@ -20,6 +30,42 @@ h1 {
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 14px;
+}
+
+.secondary-btn {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  background: #fafafa;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.secondary-btn:hover {
+  background: #efefef;
+}
+
+body.detached #detachBtn {
+  display: none;
+}
+
+body:not(.detached) #pinBtn,
+body.pip #pinBtn,
+body.pip #detachBtn {
+  display: none;
+}
+
+body.pip .container {
+  padding: 12px;
+}
+
+@media all and (display-mode: picture-in-picture) {
+  body {
+    width: auto;
+    min-width: 360px;
+  }
 }
 
 /* ── Controls ── */
