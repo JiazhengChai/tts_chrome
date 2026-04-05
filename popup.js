@@ -32,7 +32,7 @@ seedTargetTab().catch(() => {});
   try {
     const target = await getTargetTab();
     if (!target?.tabId) return;
-    const state = await ensureContentScriptAndSend(target.tabId, { action: 'getState' });
+    const state = await ensureContentScriptAndSend(target.tabId, { action: 'getState' }, target.frameId);
     if (state) updateButtons(state);
   } catch (e) {
     $('status').textContent = '⚠ ' + e.message;
@@ -61,6 +61,24 @@ async function getTargetTab() {
   return target;
 }
 
+async function findSelectionFrameId(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => {
+      try {
+        const selection = window.getSelection();
+        const text = selection ? selection.toString().trim() : '';
+        return Boolean(selection && !selection.isCollapsed && text.length > 0);
+      } catch {
+        return false;
+      }
+    }
+  });
+
+  const selected = results.find(result => result.result);
+  return typeof selected?.frameId === 'number' ? selected.frameId : null;
+}
+
 async function seedTargetTab() {
   if (isDetachedMode || isPipMode) {
     return;
@@ -86,12 +104,12 @@ async function getSourceTabIdForDetach() {
 
 async function sendToTab(msg) {
   const target = await getTargetTab();
-  return ensureContentScriptAndSend(target.tabId, msg);
+  return ensureContentScriptAndSend(target.tabId, msg, target.frameId);
 }
 
-async function ensureContentScript(tabId) {
+async function ensureContentScript(tabId, frameId = null) {
   try {
-    await chrome.tabs.sendMessage(tabId, { action: 'getState' });
+    await chrome.tabs.sendMessage(tabId, { action: 'getState' }, frameId === null ? undefined : { frameId });
     return;
   } catch (error) {
     if (!String(error?.message || '').includes('Receiving end does not exist')) {
@@ -100,18 +118,18 @@ async function ensureContentScript(tabId) {
   }
 
   await chrome.scripting.insertCSS({
-    target: { tabId },
+    target: frameId === null ? { tabId } : { tabId, frameIds: [frameId] },
     files: ['styles.css']
   });
   await chrome.scripting.executeScript({
-    target: { tabId },
+    target: frameId === null ? { tabId } : { tabId, frameIds: [frameId] },
     files: ['content.js']
   });
 }
 
-async function ensureContentScriptAndSend(tabId, msg) {
-  await ensureContentScript(tabId);
-  return chrome.tabs.sendMessage(tabId, msg);
+async function ensureContentScriptAndSend(tabId, msg, frameId = null) {
+  await ensureContentScript(tabId, frameId);
+  return chrome.tabs.sendMessage(tabId, msg, frameId === null ? undefined : { frameId });
 }
 
 // ── Button handlers ──
@@ -128,7 +146,14 @@ $('readBtn').addEventListener('click', async () => {
   $('status').textContent = 'Starting…';
 
   try {
-    await sendToTab({ action: 'read' });
+    const target = await getTargetTab();
+    const frameId = target.frameId !== null ? target.frameId : await findSelectionFrameId(target.tabId);
+
+    if (frameId !== null) {
+      await chrome.runtime.sendMessage({ action: 'setTargetTab', tabId: target.tabId, frameId });
+    }
+
+    await ensureContentScriptAndSend(target.tabId, { action: 'read' }, frameId);
     $('pauseBtn').disabled = false;
     $('stopBtn').disabled  = false;
   } catch (e) {

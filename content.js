@@ -30,6 +30,26 @@
     return match ? match[1] : 'ja';
   }
 
+  // ═══════════════════ Selection caching ═══════════════════
+
+  let cachedSelection = null;
+
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+      try {
+        cachedSelection = {
+          range: sel.getRangeAt(0).cloneRange(),
+          ts: Date.now()
+        };
+      } catch { /* ignore */ }
+    }
+  });
+
+  function isGoogleDocs() {
+    return location.hostname === 'docs.google.com' && /\/document\//.test(location.pathname);
+  }
+
   // ═══════════════════ CSS Custom Highlight ═══════════════════
 
   let wordHL = null;
@@ -56,6 +76,19 @@
 
   /** Heuristic: find the element most likely to be the article body. */
   function findArticle() {
+    // Google Docs: target the editor content area
+    if (isGoogleDocs()) {
+      const gdocSelectors = [
+        '.kix-appview-editor',
+        '.kix-paginateddocumentplugin',
+        '.kix-page-content-wrapper'
+      ];
+      for (const sel of gdocSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.textContent.trim().length > 50) return el;
+      }
+    }
+
     const candidates = [
       'article', '[role="main"]', 'main',
       '.article-body', '.entry-content', '.post-content',
@@ -97,13 +130,26 @@
 
   function extractWords() {
     const sel = window.getSelection();
-    const hasSelection = sel && !sel.isCollapsed && sel.toString().trim().length > 0;
+    let hasSelection = sel && !sel.isCollapsed && sel.toString().trim().length > 0;
+    let activeRange = null;
+
+    if (hasSelection) {
+      activeRange = sel.getRangeAt(0);
+    } else if (cachedSelection && (Date.now() - cachedSelection.ts) < 30000) {
+      // Use cached selection (e.g. cleared when popup opened)
+      try {
+        cachedSelection.range.getBoundingClientRect(); // verify still valid
+        hasSelection = true;
+        activeRange = cachedSelection.range;
+      } catch { /* range invalidated by DOM change */ }
+    }
+    cachedSelection = null; // consume
 
     // Determine reading root
     let root = findArticle();
-    if (hasSelection) {
+    if (hasSelection && activeRange) {
       // Make sure we use a container that includes the selection
-      const selNode = sel.getRangeAt(0).startContainer;
+      const selNode = activeRange.startContainer;
       if (!root.contains(selNode)) {
         let container = selNode.nodeType === Node.TEXT_NODE ? selNode.parentElement : selNode;
         while (container && container !== document.body && !BLOCK_TAGS.has(container.tagName)) {
@@ -117,14 +163,16 @@
     const segmenter = new Intl.Segmenter(state.segmentLanguage, { granularity: 'word' });
     const words = [];
 
-    const selRange = hasSelection ? sel.getRangeAt(0) : null;
-    const selPoint = hasSelection ? document.createRange() : null;
+    const selRange = hasSelection ? activeRange : null;
+    const selPoint = (hasSelection && selRange) ? document.createRange() : null;
     let startWordIndex = 0;
     let foundStart = !hasSelection;
 
     if (selPoint) {
-      selPoint.setStart(selRange.startContainer, selRange.startOffset);
-      selPoint.collapse(true);
+      try {
+        selPoint.setStart(selRange.startContainer, selRange.startOffset);
+        selPoint.collapse(true);
+      } catch { foundStart = true; /* invalid range, skip selection matching */ }
     }
 
     for (const node of nodes) {
@@ -137,6 +185,19 @@
           startWordIndex = word.globalIndex;
           foundStart = true;
         }
+      }
+    }
+
+    // Google Docs fallback: start from first word visible in viewport
+    if (!hasSelection && isGoogleDocs() && words.length > 0) {
+      for (let i = 0; i < words.length; i++) {
+        try {
+          const rect = words[i].range.getBoundingClientRect();
+          if (rect.bottom > 0 && rect.top < window.innerHeight) {
+            startWordIndex = i;
+            break;
+          }
+        } catch { /* skip */ }
       }
     }
 

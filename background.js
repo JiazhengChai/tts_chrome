@@ -6,6 +6,7 @@ const STORE = 'audio';
 const DETACHED_CONTROLLER_URL = chrome.runtime.getURL('popup.html?detached=1');
 
 let targetTabId = null;
+let targetFrameId = null;
 
 function isSupportedUrl(url) {
   return typeof url === 'string' && /^https?:\/\//.test(url);
@@ -23,12 +24,37 @@ async function setTargetTab(tabId) {
     const tab = await chrome.tabs.get(tabId);
     if (isSupportedUrl(tab.url)) {
       targetTabId = tab.id;
+      targetFrameId = null;
     }
   } catch {
     if (targetTabId === tabId) {
       targetTabId = null;
+      targetFrameId = null;
     }
   }
+}
+
+async function setTargetFrame(tabId, frameId) {
+  await setTargetTab(tabId);
+  targetFrameId = typeof frameId === 'number' ? frameId : null;
+}
+
+async function findSelectionFrameId(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => {
+      try {
+        const selection = window.getSelection();
+        const text = selection ? selection.toString().trim() : '';
+        return Boolean(selection && !selection.isCollapsed && text.length > 0);
+      } catch {
+        return false;
+      }
+    }
+  });
+
+  const selected = results.find(result => result.result);
+  return typeof selected?.frameId === 'number' ? selected.frameId : null;
 }
 
 async function resolveTargetTab() {
@@ -36,10 +62,11 @@ async function resolveTargetTab() {
     try {
       const tab = await chrome.tabs.get(targetTabId);
       if (isSupportedUrl(tab.url)) {
-        return tab;
+        return { ...tab, frameId: targetFrameId };
       }
     } catch {
       targetTabId = null;
+      targetFrameId = null;
     }
   }
 
@@ -47,7 +74,8 @@ async function resolveTargetTab() {
   const fallback = tabs.find(tab => isSupportedUrl(tab.url));
   if (fallback?.id) {
     targetTabId = fallback.id;
-    return fallback;
+    targetFrameId = null;
+    return { ...fallback, frameId: null };
   }
 
   return null;
@@ -87,12 +115,14 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tab.active && changeInfo.status === 'complete' && isSupportedUrl(tab.url)) {
     targetTabId = tabId;
+    targetFrameId = null;
   }
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
   if (targetTabId === tabId) {
     targetTabId = null;
+    targetFrameId = null;
   }
 });
 
@@ -169,8 +199,8 @@ async function synthesize(ssml, apiKey, voice) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'setTargetTab') {
-    setTargetTab(msg.tabId)
-      .then(() => sendResponse({ ok: true, tabId: targetTabId }))
+    (typeof msg.frameId === 'number' ? setTargetFrame(msg.tabId, msg.frameId) : setTargetTab(msg.tabId))
+      .then(() => sendResponse({ ok: true, tabId: targetTabId, frameId: targetFrameId }))
       .catch(e => sendResponse({ error: e.message }));
     return true;
   }
@@ -184,7 +214,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.action === 'getTargetTab') {
     resolveTargetTab()
-      .then(tab => sendResponse(tab ? { tabId: tab.id, url: tab.url, title: tab.title } : { error: 'Open a normal web page first.' }))
+      .then(tab => sendResponse(tab ? { tabId: tab.id, frameId: tab.frameId ?? null, url: tab.url, title: tab.title } : { error: 'Open a normal web page first.' }))
       .catch(e => sendResponse({ error: e.message }));
     return true;
   }
@@ -254,7 +284,20 @@ chrome.commands.onCommand.addListener(async command => {
   if (command === 'toggle-reading') {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id) {
-      chrome.tabs.sendMessage(tab.id, { action: 'toggleRead' });
+      const resolved = await resolveTargetTab();
+      let frameId = resolved?.id === tab.id ? resolved.frameId ?? null : null;
+
+      if (frameId === null) {
+        frameId = await findSelectionFrameId(tab.id);
+      }
+
+      if (frameId !== null) {
+        await setTargetFrame(tab.id, frameId);
+        chrome.tabs.sendMessage(tab.id, { action: 'toggleRead' }, { frameId }).catch(() => {});
+      } else {
+        await setTargetTab(tab.id);
+        chrome.tabs.sendMessage(tab.id, { action: 'toggleRead' }).catch(() => {});
+      }
     }
   }
 });
