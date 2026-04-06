@@ -1,5 +1,7 @@
 import * as pdfjsLib from './vendor/pdfjs/pdf.min.mjs';
 
+pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('vendor/pdfjs/pdf.worker.min.mjs');
+
 const state = {
   playing: false,
   paused: false,
@@ -7,15 +9,34 @@ const state = {
   chunks: [],
   preparedAssets: new Map(),
   chunkIndex: 0,
+  readSessionId: 0,
+  synthesisError: null,
   speed: 1.0,
+  provider: 'google',
   voice: 'ja-JP-Neural2-B',
   targetKey: null,
   targetTitle: ''
 };
 
+const PROVIDERS = {
+  GOOGLE: 'google',
+  OPENAI: 'openai'
+};
+
+const DEFAULT_GOOGLE_VOICE = 'ja-JP-Neural2-B';
+const DEFAULT_OPENAI_VOICE = 'alloy';
+
 function getVoiceLanguageCode(voice) {
   const match = /^([a-z]{2,3})-[A-Z]{2}/.exec(voice || '');
   return match ? match[1] : 'ja';
+}
+
+function getSelectedVoice(prefs, provider) {
+  if (provider === PROVIDERS.OPENAI) {
+    return prefs.openaiVoice || DEFAULT_OPENAI_VOICE;
+  }
+
+  return prefs.googleVoice || prefs.voice || DEFAULT_GOOGLE_VOICE;
 }
 
 function byteLen(text) {
@@ -94,7 +115,7 @@ function splitLongPiece(text, limitBytes) {
   return pieces;
 }
 
-function makeChunksFromText(text, limitBytes = 4800) {
+function makeGoogleChunksFromText(text, limitBytes = 4800) {
   const speakOpen = '<speak>';
   const speakClose = '</speak>';
   const joiner = '<break time="300ms"/>';
@@ -141,6 +162,68 @@ function makeChunksFromText(text, limitBytes = 4800) {
   return chunks;
 }
 
+function makeOpenAIChunksFromText(text, limitChars = 3800) {
+  const chunks = [];
+  const pieces = normalizeText(text)
+    .split(/\n{2,}/)
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  let current = '';
+
+  for (const piece of pieces) {
+    if (!current && piece.length > limitChars) {
+      const subPieces = splitLongPiece(piece, Math.min(limitChars, 3000));
+      for (const subPiece of subPieces) {
+        chunks.push({
+          text: subPiece,
+          input: subPiece,
+          memoryKey: `${state.provider}|${state.voice}|${subPiece}`
+        });
+      }
+      continue;
+    }
+
+    const next = current ? `${current}\n\n${piece}` : piece;
+    if (current && next.length > limitChars) {
+      chunks.push({
+        text: current,
+        input: current,
+        memoryKey: `${state.provider}|${state.voice}|${current}`
+      });
+      if (piece.length > limitChars) {
+        const subPieces = splitLongPiece(piece, Math.min(limitChars, 3000));
+        for (const subPiece of subPieces) {
+          chunks.push({
+            text: subPiece,
+            input: subPiece,
+            memoryKey: `${state.provider}|${state.voice}|${subPiece}`
+          });
+        }
+        current = '';
+      } else {
+        current = piece;
+      }
+    } else {
+      current = next;
+    }
+  }
+
+  if (current) {
+    chunks.push({
+      text: current,
+      input: current,
+      memoryKey: `${state.provider}|${state.voice}|${current}`
+    });
+  }
+
+  return chunks;
+}
+
+function makeChunksFromText(text) {
+  return state.provider === PROVIDERS.OPENAI ? makeOpenAIChunksFromText(text) : makeGoogleChunksFromText(text);
+}
+
 async function extractPdfText(sourceUrl) {
   const response = await fetch(sourceUrl, { credentials: 'include' });
   if (!response.ok) {
@@ -148,7 +231,7 @@ async function extractPdfText(sourceUrl) {
   }
 
   const data = new Uint8Array(await response.arrayBuffer());
-  const pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise;
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
   const pages = [];
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
@@ -214,11 +297,100 @@ function b64ToBlob(b64) {
   return new Blob([bytes], { type: 'audio/mpeg' });
 }
 
+async function getSettings() {
+  const response = await chrome.runtime.sendMessage({ action: 'getSettings' });
+  if (response?.error) {
+    throw new Error(response.error);
+  }
+  return response?.settings || {};
+}
+
+async function synthesizeChunk(chunk, chunkIndex, url, sessionId) {
+  if (!state.playing || state.readSessionId !== sessionId || chunk.audioContent) {
+    return;
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    action: 'synthesize',
+    chunks: [{
+      text: chunk.text,
+      input: chunk.input,
+      ssml: chunk.ssml,
+      index: chunkIndex
+    }],
+    provider: state.provider,
+    voice: state.voice,
+    url
+  });
+
+  if (response?.error) {
+    throw new Error(response.error);
+  }
+
+  if (!state.playing || state.readSessionId !== sessionId) {
+    return;
+  }
+
+  const result = response.results?.[0];
+  if (!result?.audioContent) {
+    throw new Error('No audio returned from the TTS provider.');
+  }
+
+  chunk.audioContent = result.audioContent;
+  chunk.timepoints = result.timepoints || [];
+  state.preparedAssets.set(chunk.memoryKey, {
+    audioContent: result.audioContent,
+    timepoints: result.timepoints || []
+  });
+}
+
+async function prefetchChunks(chunks, url, sessionId, startIndex) {
+  for (let chunkIndex = startIndex; chunkIndex < chunks.length; chunkIndex++) {
+    const chunk = chunks[chunkIndex];
+    if (!chunk || chunk.audioContent) {
+      continue;
+    }
+
+    try {
+      await synthesizeChunk(chunk, chunkIndex, url, sessionId);
+    } catch (error) {
+      if (state.playing && state.readSessionId === sessionId) {
+        state.synthesisError = error;
+        notify('error', error.message);
+      }
+      return;
+    }
+  }
+}
+
+function waitForChunk(chunkIndex, sessionId) {
+  if (!state.playing || state.readSessionId !== sessionId || state.chunkIndex !== chunkIndex) {
+    return;
+  }
+
+  if (state.synthesisError) {
+    const error = state.synthesisError;
+    stopReading(false);
+    notify('error', error.message);
+    return;
+  }
+
+  if (state.chunks[chunkIndex]?.audioContent) {
+    playNextChunk();
+    return;
+  }
+
+  notify('loading', 'Preparing audio…');
+  setTimeout(() => waitForChunk(chunkIndex, sessionId), 150);
+}
+
 async function startReading(target) {
   stopReading(false);
+  const sessionId = state.readSessionId;
 
-  const prefs = await chrome.storage.sync.get(['voice', 'speed']);
-  if (prefs.voice) state.voice = prefs.voice;
+  const prefs = await getSettings();
+  state.provider = prefs.provider === PROVIDERS.OPENAI ? PROVIDERS.OPENAI : PROVIDERS.GOOGLE;
+  state.voice = getSelectedVoice(prefs, state.provider);
   if (prefs.speed) state.speed = prefs.speed;
 
   const text = await getDocumentText(target);
@@ -233,6 +405,7 @@ async function startReading(target) {
   state.chunkIndex = 0;
   state.playing = true;
   state.paused = false;
+  state.synthesisError = null;
 
   for (const chunk of chunks) {
     const cached = state.preparedAssets.get(chunk.memoryKey);
@@ -242,41 +415,19 @@ async function startReading(target) {
     }
   }
 
-  const missingChunks = chunks.filter(chunk => !chunk.audioContent);
-  if (missingChunks.length > 0) {
-    notify('loading', `Synthesizing ${missingChunks.length} chunk(s)…`);
-    const response = await chrome.runtime.sendMessage({
-      action: 'synthesize',
-      chunks: missingChunks.map((chunk, index) => ({
-        text: chunk.text,
-        ssml: chunk.ssml,
-        index: chunks.indexOf(chunk) || index
-      })),
-      voice: state.voice,
-      url: target.sourceUrl || target.url
-    });
+  const firstChunk = chunks[0];
+  if (!firstChunk?.audioContent) {
+    notify('loading', 'Synthesizing audio…');
+    await synthesizeChunk(firstChunk, 0, target.sourceUrl || target.url, sessionId);
+  }
 
-    if (response?.error) {
-      throw new Error(response.error);
-    }
-
-    for (const result of response.results || []) {
-      const chunk = chunks[result.chunkIndex];
-      if (!chunk) {
-        continue;
-      }
-
-      chunk.audioContent = result.audioContent;
-      chunk.timepoints = result.timepoints || [];
-      state.preparedAssets.set(chunk.memoryKey, {
-        audioContent: result.audioContent,
-        timepoints: result.timepoints || []
-      });
-    }
+  if (!state.playing || state.readSessionId !== sessionId) {
+    return;
   }
 
   notify('playing', `Reading ${target.documentType === 'pdf' ? 'PDF' : 'document'}…`);
   playNextChunk();
+  void prefetchChunks(chunks, target.sourceUrl || target.url, sessionId, 1);
 }
 
 function playNextChunk() {
@@ -287,8 +438,7 @@ function playNextChunk() {
 
   const chunk = state.chunks[state.chunkIndex];
   if (!chunk?.audioContent) {
-    state.chunkIndex += 1;
-    playNextChunk();
+    waitForChunk(state.chunkIndex, state.readSessionId);
     return;
   }
 
@@ -347,10 +497,12 @@ function pauseReading() {
 
 function stopReading(notifyReady = true) {
   const wasPlaying = state.playing;
+  state.readSessionId += 1;
   state.playing = false;
   state.paused = false;
   state.chunkIndex = 0;
   state.chunks = [];
+  state.synthesisError = null;
   if (state.audio) {
     state.audio.pause();
     state.audio = null;
@@ -395,7 +547,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const command = async () => {
     switch (msg.command) {
       case 'read':
-        await startReading(msg.target);
+        startReading(msg.target).catch(error => notify('error', error.message));
         return { ok: true };
       case 'pause':
         pauseReading();
@@ -410,7 +562,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (state.playing) {
           pauseReading();
         } else {
-          await startReading(msg.target);
+          startReading(msg.target).catch(error => notify('error', error.message));
         }
         return { ok: true };
       case 'getState':

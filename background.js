@@ -8,6 +8,12 @@ const OFFSCREEN_DOCUMENT_URL = 'offscreen.html';
 const PDF_VIEWER_EXTENSION_ID = 'mhjfbmdgcfjbbpaeojofohoefgiehjai';
 const PDF_URL_RE = /\.pdf(?:$|[?#])/i;
 const TEXT_DOCUMENT_URL_RE = /\.(?:txt|text|md|markdown|csv|tsv|log|json|xml|ya?ml|ini|cfg|conf|srt|vtt)(?:$|[?#])/i;
+const PROVIDERS = {
+  GOOGLE: 'google',
+  OPENAI: 'openai'
+};
+const DEFAULT_GOOGLE_VOICE = 'ja-JP-Neural2-B';
+const DEFAULT_OPENAI_VOICE = 'alloy';
 
 let targetTabId = null;
 let targetFrameId = null;
@@ -109,6 +115,54 @@ async function sendOffscreenCommand(command, payload = {}) {
     command,
     ...payload
   });
+}
+
+function getDefaultVoice(provider) {
+  return provider === PROVIDERS.OPENAI ? DEFAULT_OPENAI_VOICE : DEFAULT_GOOGLE_VOICE;
+}
+
+function getSelectedVoice(settings, provider) {
+  if (provider === PROVIDERS.OPENAI) {
+    return settings.openaiVoice || DEFAULT_OPENAI_VOICE;
+  }
+
+  return settings.googleVoice || settings.voice || DEFAULT_GOOGLE_VOICE;
+}
+
+function getSelectedApiKey(settings, provider) {
+  if (provider === PROVIDERS.OPENAI) {
+    return settings.openaiApiKey || '';
+  }
+
+  return settings.googleApiKey || settings.apiKey || '';
+}
+
+async function getStoredSettings() {
+  const storageArea = chrome.storage?.sync || chrome.storage?.local;
+  if (!storageArea) {
+    throw new Error('Extension storage is unavailable. Reload the extension and try again.');
+  }
+
+  return storageArea.get([
+    'provider',
+    'apiKey',
+    'googleApiKey',
+    'openaiApiKey',
+    'voice',
+    'googleVoice',
+    'openaiVoice',
+    'speed'
+  ]);
+}
+
+async function setStoredSettings(values) {
+  const storageArea = chrome.storage?.sync || chrome.storage?.local;
+  if (!storageArea) {
+    throw new Error('Extension storage is unavailable. Reload the extension and try again.');
+  }
+
+  await storageArea.set(values);
+  return getStoredSettings();
 }
 
 function getVoiceLanguageCode(voice) {
@@ -296,6 +350,40 @@ async function synthesize(ssml, apiKey, voice) {
   return res.json();
 }
 
+async function synthesizeOpenAI(input, apiKey, voice) {
+  const res = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'tts-1',
+      input,
+      voice,
+      response_format: 'mp3'
+    })
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || `OpenAI TTS error (${res.status})`);
+  }
+
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  let binary = '';
+  const chunkSize = 0x8000;
+
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+
+  return {
+    audioContent: btoa(binary),
+    timepoints: []
+  };
+}
+
 // ── Message handler ──
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -324,6 +412,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'getSettings') {
+    getStoredSettings()
+      .then(settings => sendResponse({ settings }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  if (msg.action === 'setSettings') {
+    setStoredSettings(msg.values || {})
+      .then(settings => sendResponse({ settings }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
   if (msg.action === 'documentReaderCommand') {
     sendOffscreenCommand(msg.command, { target: msg.target, speed: msg.speed })
       .then(sendResponse)
@@ -343,19 +445,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+
+  return false;
 });
 
-async function handleSynthesize({ chunks, voice, url }) {
-  const { apiKey } = await chrome.storage.sync.get('apiKey');
+async function handleSynthesize({ chunks, provider, voice, url }) {
+  const settings = await getStoredSettings();
+  const activeProvider = provider === PROVIDERS.OPENAI ? PROVIDERS.OPENAI : (settings.provider === PROVIDERS.OPENAI ? PROVIDERS.OPENAI : PROVIDERS.GOOGLE);
+  const activeVoice = voice || getSelectedVoice(settings, activeProvider) || getDefaultVoice(activeProvider);
+  const apiKey = getSelectedApiKey(settings, activeProvider);
+
   if (!apiKey) {
-    throw new Error('API key not configured. Click the extension icon to set it.');
+    throw new Error(`${activeProvider === PROVIDERS.OPENAI ? 'OpenAI' : 'Google Cloud'} API key not configured. Click the extension icon to set it.`);
   }
 
   const db = await openDB();
   const results = [];
 
   for (const chunk of chunks) {
-    const cacheKey = await sha256(`v3|${voice}|${chunk.ssml}`);
+    const synthInput = chunk.ssml || chunk.input;
+    const cacheKey = await sha256(`v4|${activeProvider}|${activeVoice}|${synthInput}`);
 
     const cached = await dbGet(db, cacheKey);
     if (cached?.audioContent) {
@@ -368,13 +477,16 @@ async function handleSynthesize({ chunks, voice, url }) {
       continue;
     }
 
-    const data = await synthesize(chunk.ssml, apiKey, voice);
+    const data = activeProvider === PROVIDERS.OPENAI
+      ? await synthesizeOpenAI(chunk.input, apiKey, activeVoice)
+      : await synthesize(chunk.ssml, apiKey, activeVoice);
 
     await dbPut(db, {
       key: cacheKey,
       audioContent: data.audioContent,
       timepoints: data.timepoints || [],
-      voice,
+      provider: activeProvider,
+      voice: activeVoice,
       url,
       ts: Date.now()
     });

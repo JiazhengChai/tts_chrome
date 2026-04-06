@@ -20,14 +20,42 @@
     startWordIndex: 0,
     rafId: null,
     activeWordKey: null,
+    readSessionId: 0,
+    synthesisError: null,
     speed: 1.0,
+    provider: 'google',
     voice: 'ja-JP-Neural2-B',
     segmentLanguage: 'ja'
   };
 
+  const PROVIDERS = {
+    GOOGLE: 'google',
+    OPENAI: 'openai'
+  };
+
+  const DEFAULT_GOOGLE_VOICE = 'ja-JP-Neural2-B';
+  const DEFAULT_OPENAI_VOICE = 'alloy';
+
   function getVoiceLanguageCode(voice) {
     const match = /^([a-z]{2,3})-[A-Z]{2}/.exec(voice || '');
     return match ? match[1] : 'ja';
+  }
+
+  function resolvePageLanguage() {
+    const lang = document.documentElement?.lang || navigator.language || 'ja';
+    return lang.split('-')[0] || 'ja';
+  }
+
+  function resolveSegmentLanguage(provider, voice) {
+    return provider === PROVIDERS.OPENAI ? resolvePageLanguage() : getVoiceLanguageCode(voice);
+  }
+
+  function getSelectedVoice(prefs, provider) {
+    if (provider === PROVIDERS.OPENAI) {
+      return prefs.openaiVoice || DEFAULT_OPENAI_VOICE;
+    }
+
+    return prefs.googleVoice || prefs.voice || DEFAULT_GOOGLE_VOICE;
   }
 
   // ═══════════════════ Selection caching ═══════════════════
@@ -242,7 +270,7 @@
 
   /** Split words into chunks whose text stays under `limit` UTF-8 bytes.
    *  GCP TTS hard-limits SSML input to 5000 bytes; we use 4700 for safety. */
-  function makeChunks(words, limitBytes = 4800) {
+  function makeGoogleChunks(words, limitBytes = 4800) {
     const speakOpen = '<speak>';
     const speakClose = '</speak>';
     const chunks = [];
@@ -288,6 +316,43 @@
     return chunks;
   }
 
+  function makeOpenAIChunks(words, limitChars = 3800) {
+    const chunks = [];
+    let current = {
+      text: '',
+      words: [],
+      input: ''
+    };
+
+    for (const word of words) {
+      const nextInput = current.input + word.text;
+      if (current.input && nextInput.length > limitChars) {
+        current.memoryKey = `${state.provider}|${state.voice}|${current.input}`;
+        chunks.push(current);
+        current = {
+          text: '',
+          words: [],
+          input: ''
+        };
+      }
+
+      current.text += word.text;
+      current.words.push(word);
+      current.input += word.text;
+    }
+
+    if (current.input) {
+      current.memoryKey = `${state.provider}|${state.voice}|${current.input}`;
+      chunks.push(current);
+    }
+
+    return chunks;
+  }
+
+  function makeChunks(words) {
+    return state.provider === PROVIDERS.OPENAI ? makeOpenAIChunks(words) : makeGoogleChunks(words);
+  }
+
   // ═══════════════════ Timing estimation ═══════════════════
 
   function applyTimepoints(chunk, duration) {
@@ -306,6 +371,42 @@
         ? nextStart
         : Math.min(duration, startTime + 0.35);
     }
+  }
+
+  function estimateWordWeight(word) {
+    const text = (word.text || '').trim();
+    if (!text) {
+      return 0.15;
+    }
+
+    if (!word.isWordLike) {
+      return Math.min(0.35, Math.max(0.12, text.length * 0.08));
+    }
+
+    return Math.max(0.2, text.length);
+  }
+
+  function applyEstimatedTimepoints(chunk, duration) {
+    const words = chunk.words || [];
+    if (!words.length || !(duration > 0)) {
+      return;
+    }
+
+    const weights = words.map(estimateWordWeight);
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || words.length;
+    let elapsed = 0;
+
+    for (let index = 0; index < words.length; index++) {
+      const word = words[index];
+      const startTime = elapsed;
+      elapsed += duration * (weights[index] / totalWeight);
+      word.startTime = startTime;
+      word.endTime = index === words.length - 1 ? duration : elapsed;
+    }
+  }
+
+  function hasWordTimings(chunk) {
+    return chunk.words?.some(word => typeof word.startTime === 'number' && typeof word.endTime === 'number');
   }
 
   function findPlaybackStart(chunks, startWordIndex) {
@@ -333,14 +434,103 @@
     return new Blob([bytes], { type: 'audio/mpeg' });
   }
 
+  async function getSettings() {
+    const response = await chrome.runtime.sendMessage({ action: 'getSettings' });
+    if (response?.error) {
+      throw new Error(response.error);
+    }
+    return response?.settings || {};
+  }
+
+  async function synthesizeChunk(chunk, chunkIndex, url, sessionId) {
+    if (!state.playing || state.readSessionId !== sessionId || chunk.audioContent) {
+      return;
+    }
+
+    const resp = await chrome.runtime.sendMessage({
+      action: 'synthesize',
+      chunks: [{
+        text: chunk.text,
+        input: chunk.input,
+        ssml: chunk.ssml,
+        index: chunkIndex
+      }],
+      provider: state.provider,
+      voice: state.voice,
+      url
+    });
+
+    if (resp?.error) {
+      throw new Error(resp.error);
+    }
+
+    if (!state.playing || state.readSessionId !== sessionId) {
+      return;
+    }
+
+    const result = resp.results?.[0];
+    if (!result?.audioContent) {
+      throw new Error('No audio returned from the TTS provider.');
+    }
+
+    chunk.audioContent = result.audioContent;
+    chunk.timepoints = result.timepoints || [];
+    state.preparedAssets.set(chunk.memoryKey, {
+      audioContent: result.audioContent,
+      timepoints: result.timepoints || []
+    });
+  }
+
+  async function prefetchChunks(chunks, url, sessionId, startIndex) {
+    for (let chunkIndex = startIndex; chunkIndex < chunks.length; chunkIndex++) {
+      const chunk = chunks[chunkIndex];
+      if (!chunk || chunk.audioContent) {
+        continue;
+      }
+
+      try {
+        await synthesizeChunk(chunk, chunkIndex, url, sessionId);
+      } catch (error) {
+        if (state.playing && state.readSessionId === sessionId) {
+          state.synthesisError = error;
+          notify('error', error.message);
+        }
+        return;
+      }
+    }
+  }
+
+  function waitForChunk(chunkIndex, sessionId) {
+    if (!state.playing || state.readSessionId !== sessionId || state.chunkIndex !== chunkIndex) {
+      return;
+    }
+
+    if (state.synthesisError) {
+      const error = state.synthesisError;
+      stopReading(false);
+      notify('error', error.message);
+      return;
+    }
+
+    if (state.chunks[chunkIndex]?.audioContent) {
+      playNextChunk();
+      return;
+    }
+
+    notify('loading', 'Preparing audio…');
+    setTimeout(() => waitForChunk(chunkIndex, sessionId), 150);
+  }
+
   async function startReading() {
     stopReading();
+    const sessionId = state.readSessionId;
 
     // Reload preferences
-    const prefs = await chrome.storage.sync.get(['voice', 'speed']);
-    if (prefs.voice) state.voice = prefs.voice;
+    const prefs = await getSettings();
+    state.provider = prefs.provider === PROVIDERS.OPENAI ? PROVIDERS.OPENAI : PROVIDERS.GOOGLE;
+    state.voice = getSelectedVoice(prefs, state.provider);
     if (prefs.speed) state.speed = prefs.speed;
-    state.segmentLanguage = getVoiceLanguageCode(state.voice);
+    state.segmentLanguage = resolveSegmentLanguage(state.provider, state.voice);
 
     const extracted = extractWords();
     const words = extracted.words;
@@ -368,48 +558,27 @@
     state.startWordIndex = extracted.startWordIndex;
     state.playing = true;
     state.paused = false;
+    state.synthesisError = null;
 
-    const missingChunks = chunks.filter(chunk => !chunk.audioContent);
+    const currentChunk = chunks[playbackStart.chunkIndex];
+    if (!currentChunk?.audioContent) {
+      notify('loading', 'Synthesizing audio…');
+      try {
+        await synthesizeChunk(currentChunk, playbackStart.chunkIndex, location.href, sessionId);
+      } catch (e) {
+        state.playing = false;
+        notify('error', e.message);
+        return;
+      }
+    }
 
-    if (missingChunks.length === 0) {
-      notify('playing', 'Reading from cache…');
-      playNextChunk();
+    if (!state.playing || state.readSessionId !== sessionId) {
       return;
     }
 
-    notify('loading', `Synthesizing ${missingChunks.length} chunk(s)…`);
-
-    try {
-      const resp = await chrome.runtime.sendMessage({
-        action: 'synthesize',
-        chunks: missingChunks.map(chunk => ({
-          text: chunk.text,
-          ssml: chunk.ssml,
-          index: chunks.indexOf(chunk)
-        })),
-        voice: state.voice,
-        url: location.href
-      });
-
-      if (resp?.error) { notify('error', resp.error); state.playing = false; return; }
-      if (!state.playing) return; // stopped while waiting
-
-      // Attach audio data
-      for (const r of resp.results) {
-        chunks[r.chunkIndex].audioContent = r.audioContent;
-        chunks[r.chunkIndex].timepoints = r.timepoints || [];
-        state.preparedAssets.set(chunks[r.chunkIndex].memoryKey, {
-          audioContent: r.audioContent,
-          timepoints: r.timepoints || []
-        });
-      }
-
-      notify('playing', 'Reading…');
-      playNextChunk();
-    } catch (e) {
-      notify('error', e.message);
-      state.playing = false;
-    }
+    notify('playing', currentChunk?.audioContent ? 'Reading…' : 'Reading from cache…');
+    playNextChunk();
+    void prefetchChunks(chunks, location.href, sessionId, playbackStart.chunkIndex + 1);
   }
 
   function playNextChunk() {
@@ -419,7 +588,10 @@
     }
 
     const chunk = state.chunks[state.chunkIndex];
-    if (!chunk.audioContent) { state.chunkIndex++; playNextChunk(); return; }
+    if (!chunk.audioContent) {
+      waitForChunk(state.chunkIndex, state.readSessionId);
+      return;
+    }
 
     const url = URL.createObjectURL(b64ToBlob(chunk.audioContent));
     const audio = new Audio(url);
@@ -427,17 +599,26 @@
     state.audio = audio;
 
     audio.addEventListener('loadedmetadata', () => {
-      applyTimepoints(chunk, audio.duration);
-      if (state.chunkIndex === state.startChunkIndex) {
+      if (chunk.timepoints?.length) {
+        applyTimepoints(chunk, audio.duration);
+      } else if (!hasWordTimings(chunk)) {
+        applyEstimatedTimepoints(chunk, audio.duration);
+      }
+      if (hasWordTimings(chunk) && state.chunkIndex === state.startChunkIndex) {
         audio.currentTime = findSeekTime(chunk, state.startWordIndex);
       }
       audio.play();
-      runHighlightLoop(chunk);
+      if (hasWordTimings(chunk)) {
+        runHighlightLoop(chunk);
+      } else if (wordHL) {
+        wordHL.clear();
+      }
     });
 
     audio.addEventListener('ended', () => {
       URL.revokeObjectURL(url);
       cancelAnimationFrame(state.rafId);
+      state.activeWordKey = null;
       state.chunkIndex++;
       playNextChunk();
     });
@@ -446,6 +627,7 @@
       console.error('[TTS Reader] Audio error', e);
       URL.revokeObjectURL(url);
       cancelAnimationFrame(state.rafId);
+      state.activeWordKey = null;
       state.chunkIndex++;
       playNextChunk();
     });
@@ -496,7 +678,9 @@
     if (state.paused) {
       state.paused = false;
       state.audio.play();
-      runHighlightLoop(state.chunks[state.chunkIndex]);
+      if (hasWordTimings(state.chunks[state.chunkIndex])) {
+        runHighlightLoop(state.chunks[state.chunkIndex]);
+      }
       notify('playing', 'Reading…');
     } else {
       state.paused = true;
@@ -508,6 +692,7 @@
 
   function stopReading() {
     const wasPlaying = state.playing;
+    state.readSessionId += 1;
     state.playing = false;
     state.paused = false;
     if (state.audio) {
@@ -516,6 +701,7 @@
     }
     cancelAnimationFrame(state.rafId);
     state.activeWordKey = null;
+    state.synthesisError = null;
     state.startChunkIndex = 0;
     state.startWordIndex = 0;
     if (wordHL) wordHL.clear();
@@ -536,7 +722,7 @@
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     switch (msg.action) {
       case 'read':
-        startReading();
+        startReading().catch(error => notify('error', error.message));
         reply({ ok: true });
         break;
       case 'pause':
@@ -552,7 +738,11 @@
         reply({ ok: true });
         break;
       case 'toggleRead':
-        if (state.playing) pauseReading(); else startReading();
+        if (state.playing) {
+          pauseReading();
+        } else {
+          startReading().catch(error => notify('error', error.message));
+        }
         reply({ ok: true });
         break;
       case 'getState':
