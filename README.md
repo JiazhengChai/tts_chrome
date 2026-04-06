@@ -1,15 +1,17 @@
 # Japanese TTS Reader — Chrome Extension
 
-Read Japanese web articles aloud with **word-level highlighting**, powered by Google Cloud Text-to-Speech.
+Read Japanese webpages, text documents, and PDFs aloud with Google Cloud Text-to-Speech.
 
 ## Features
 
 - **Natural Japanese speech** using GCP Neural2 / WaveNet voices
-- **Word-level highlighting** via the CSS Custom Highlight API (Chrome 105+)
+- **Word-level highlighting** on normal webpages via the CSS Custom Highlight API (Chrome 105+)
 - **Read from selection** — select text and click Read to start from that point and continue to the end of the article
 - **Audio caching** — revisiting the same content skips the API call (stored in IndexedDB)
 - **Speed control** — 0.5× to 2.0×
 - **Keyboard shortcut** — `Alt+R` to toggle reading
+- **PDF support** — extracts text from browser-opened PDFs, even when Chrome uses its built-in PDF viewer
+- **Text document support** — works with browser-opened `.txt`, `.md`, `.json`, `.xml`, `.csv`, and similar text files
 
 ## Setup
 
@@ -34,10 +36,15 @@ Read Japanese web articles aloud with **word-level highlighting**, powered by Go
 
 ### 3. Use it
 
-- Navigate to any Japanese article
+- Navigate to any webpage, text document, or PDF
 - Click the extension icon → **▶ Read**
 - Or select some text first, then click **▶ Read** to start from that point
 - Use `Alt+R` to quickly toggle play/pause
+
+### Notes
+
+- PDF and text-document reading does not provide in-page word highlighting because Chrome's PDF viewer and raw document tabs do not expose a normal DOM text layer to the content script.
+- Local `file://` PDFs or text files may require enabling **Allow access to file URLs** for the unpacked extension on `chrome://extensions/`.
 
 ## Cost
 

@@ -4,12 +4,111 @@ const DB_NAME = 'tts_cache';
 const DB_VER = 1;
 const STORE = 'audio';
 const DETACHED_CONTROLLER_URL = chrome.runtime.getURL('popup.html?detached=1');
+const OFFSCREEN_DOCUMENT_URL = 'offscreen.html';
+const PDF_VIEWER_EXTENSION_ID = 'mhjfbmdgcfjbbpaeojofohoefgiehjai';
+const PDF_URL_RE = /\.pdf(?:$|[?#])/i;
+const TEXT_DOCUMENT_URL_RE = /\.(?:txt|text|md|markdown|csv|tsv|log|json|xml|ya?ml|ini|cfg|conf|srt|vtt)(?:$|[?#])/i;
 
 let targetTabId = null;
 let targetFrameId = null;
 
+function describeReadableUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl) {
+    return null;
+  }
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol === 'chrome-extension:' && url.hostname === PDF_VIEWER_EXTENSION_ID) {
+      const sourceUrl = url.searchParams.get('src');
+      if (sourceUrl) {
+        return { mode: 'document', documentType: 'pdf', sourceUrl };
+      }
+    }
+
+    if (!['http:', 'https:', 'file:'].includes(url.protocol)) {
+      return null;
+    }
+
+    if (PDF_URL_RE.test(rawUrl)) {
+      return { mode: 'document', documentType: 'pdf', sourceUrl: url.toString() };
+    }
+
+    if (TEXT_DOCUMENT_URL_RE.test(rawUrl)) {
+      return { mode: 'document', documentType: 'text', sourceUrl: url.toString() };
+    }
+
+    return { mode: 'content' };
+  } catch {
+    return null;
+  }
+}
+
 function isSupportedUrl(url) {
-  return typeof url === 'string' && /^https?:\/\//.test(url);
+  return Boolean(describeReadableUrl(url));
+}
+
+function buildTargetDescriptor(tab, frameId = null) {
+  const details = describeReadableUrl(tab?.url);
+  if (!tab?.id || !details) {
+    return null;
+  }
+
+  return {
+    tabId: tab.id,
+    frameId,
+    url: tab.url,
+    title: tab.title,
+    mode: details.mode,
+    documentType: details.documentType || null,
+    sourceUrl: details.sourceUrl || null
+  };
+}
+
+async function hasOffscreenDocument() {
+  if (chrome.offscreen.hasDocument) {
+    return chrome.offscreen.hasDocument();
+  }
+
+  if (!chrome.runtime.getContexts) {
+    return false;
+  }
+
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_URL)]
+  });
+
+  return contexts.length > 0;
+}
+
+async function ensureOffscreenDocument() {
+  if (await hasOffscreenDocument()) {
+    return;
+  }
+
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_DOCUMENT_URL,
+    reasons: ['AUDIO_PLAYBACK'],
+    justification: 'Play synthesized audio and extract text from PDFs outside the page DOM.'
+  });
+}
+
+async function sendOffscreenCommand(command, payload = {}) {
+  if (command === 'getState' && !(await hasOffscreenDocument())) {
+    return { playing: false, paused: false, speed: payload.speed || 1.0 };
+  }
+
+  if ((command === 'pause' || command === 'stop' || command === 'setSpeed') && !(await hasOffscreenDocument())) {
+    return { ok: true };
+  }
+
+  await ensureOffscreenDocument();
+  return chrome.runtime.sendMessage({
+    action: 'offscreenCommand',
+    command,
+    ...payload
+  });
 }
 
 function getVoiceLanguageCode(voice) {
@@ -22,7 +121,7 @@ async function setTargetTab(tabId) {
 
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (isSupportedUrl(tab.url)) {
+    if (buildTargetDescriptor(tab)) {
       targetTabId = tab.id;
       targetFrameId = null;
     }
@@ -61,8 +160,9 @@ async function resolveTargetTab() {
   if (targetTabId) {
     try {
       const tab = await chrome.tabs.get(targetTabId);
-      if (isSupportedUrl(tab.url)) {
-        return { ...tab, frameId: targetFrameId };
+      const descriptor = buildTargetDescriptor(tab, targetFrameId);
+      if (descriptor) {
+        return descriptor;
       }
     } catch {
       targetTabId = null;
@@ -71,11 +171,12 @@ async function resolveTargetTab() {
   }
 
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const fallback = tabs.find(tab => isSupportedUrl(tab.url));
+  const fallback = tabs.find(tab => buildTargetDescriptor(tab));
   if (fallback?.id) {
+    const descriptor = buildTargetDescriptor(fallback);
     targetTabId = fallback.id;
     targetFrameId = null;
-    return { ...fallback, frameId: null };
+    return descriptor;
   }
 
   return null;
@@ -198,6 +299,10 @@ async function synthesize(ssml, apiKey, voice) {
 // ── Message handler ──
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.action === 'offscreenCommand') {
+    return false;
+  }
+
   if (msg.action === 'setTargetTab') {
     (typeof msg.frameId === 'number' ? setTargetFrame(msg.tabId, msg.frameId) : setTargetTab(msg.tabId))
       .then(() => sendResponse({ ok: true, tabId: targetTabId, frameId: targetFrameId }))
@@ -214,7 +319,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.action === 'getTargetTab') {
     resolveTargetTab()
-      .then(tab => sendResponse(tab ? { tabId: tab.id, frameId: tab.frameId ?? null, url: tab.url, title: tab.title } : { error: 'Open a normal web page first.' }))
+      .then(tab => sendResponse(tab || { error: 'Open a readable page, text document, or PDF first.' }))
+      .catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  if (msg.action === 'documentReaderCommand') {
+    sendOffscreenCommand(msg.command, { target: msg.target, speed: msg.speed })
+      .then(sendResponse)
       .catch(e => sendResponse({ error: e.message }));
     return true;
   }
@@ -284,8 +396,24 @@ chrome.commands.onCommand.addListener(async command => {
   if (command === 'toggle-reading') {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.id) {
+      await setTargetTab(tab.id);
+      const target = await resolveTargetTab();
+      if (target?.tabId === tab.id && target.mode === 'document') {
+        sendOffscreenCommand('toggleRead', {
+          target: {
+            tabId: target.tabId,
+            url: target.url,
+            title: target.title,
+            mode: target.mode,
+            documentType: target.documentType,
+            sourceUrl: target.sourceUrl
+          }
+        }).catch(() => {});
+        return;
+      }
+
       const resolved = await resolveTargetTab();
-      let frameId = resolved?.id === tab.id ? resolved.frameId ?? null : null;
+      let frameId = resolved?.tabId === tab.id ? resolved.frameId ?? null : null;
 
       if (frameId === null) {
         frameId = await findSelectionFrameId(tab.id);

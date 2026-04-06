@@ -32,7 +32,7 @@ seedTargetTab().catch(() => {});
   try {
     const target = await getTargetTab();
     if (!target?.tabId) return;
-    const state = await ensureContentScriptAndSend(target.tabId, { action: 'getState' }, target.frameId);
+    const state = await getReaderState(target);
     if (state) updateButtons(state);
   } catch (e) {
     $('status').textContent = '⚠ ' + e.message;
@@ -56,9 +56,37 @@ async function getTargetTab() {
     throw new Error(target.error);
   }
   if (!target?.tabId) {
-    throw new Error('Open a normal web page first.');
+    throw new Error('Open a readable page, text document, or PDF first.');
   }
   return target;
+}
+
+function buildDocumentTarget(target) {
+  return {
+    tabId: target.tabId,
+    url: target.url,
+    title: target.title,
+    mode: target.mode,
+    documentType: target.documentType,
+    sourceUrl: target.sourceUrl
+  };
+}
+
+async function sendDocumentCommand(command, target, extra = {}) {
+  return chrome.runtime.sendMessage({
+    action: 'documentReaderCommand',
+    command,
+    target: buildDocumentTarget(target),
+    ...extra
+  });
+}
+
+async function getReaderState(target) {
+  if (target.mode === 'document') {
+    return sendDocumentCommand('getState', target);
+  }
+
+  return ensureContentScriptAndSend(target.tabId, { action: 'getState' }, target.frameId);
 }
 
 async function findSelectionFrameId(tabId) {
@@ -85,7 +113,7 @@ async function seedTargetTab() {
   }
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !/^https?:\/\//.test(tab.url || '')) {
+  if (!tab?.id) {
     return;
   }
 
@@ -94,7 +122,7 @@ async function seedTargetTab() {
 
 async function getSourceTabIdForDetach() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab?.id && /^https?:\/\//.test(tab.url || '')) {
+  if (tab?.id) {
     return tab.id;
   }
 
@@ -102,8 +130,12 @@ async function getSourceTabIdForDetach() {
   return target?.tabId || null;
 }
 
-async function sendToTab(msg) {
+async function sendCommand(msg) {
   const target = await getTargetTab();
+  if (target.mode === 'document') {
+    return sendDocumentCommand(msg.action, target, { speed: msg.speed });
+  }
+
   return ensureContentScriptAndSend(target.tabId, msg, target.frameId);
 }
 
@@ -147,26 +179,36 @@ $('readBtn').addEventListener('click', async () => {
 
   try {
     const target = await getTargetTab();
-    const frameId = target.frameId !== null ? target.frameId : await findSelectionFrameId(target.tabId);
+    if (target.mode === 'document') {
+      const resp = await sendDocumentCommand('read', target);
+      if (resp?.error) {
+        throw new Error(resp.error);
+      }
+      $('pauseBtn').disabled = false;
+      $('stopBtn').disabled  = false;
+    } else {
+      const frameId = target.frameId !== null ? target.frameId : await findSelectionFrameId(target.tabId);
 
-    if (frameId !== null) {
-      await chrome.runtime.sendMessage({ action: 'setTargetTab', tabId: target.tabId, frameId });
+      if (frameId !== null) {
+        await chrome.runtime.sendMessage({ action: 'setTargetTab', tabId: target.tabId, frameId });
+      }
+
+      await ensureContentScriptAndSend(target.tabId, { action: 'read' }, frameId);
+      $('pauseBtn').disabled = false;
+      $('stopBtn').disabled  = false;
     }
-
-    await ensureContentScriptAndSend(target.tabId, { action: 'read' }, frameId);
-    $('pauseBtn').disabled = false;
-    $('stopBtn').disabled  = false;
   } catch (e) {
     $('status').textContent = '⚠ ' + e.message;
+  } finally {
+    $('readBtn').disabled = false;
   }
-  $('readBtn').disabled = false;
 });
 
-$('pauseBtn').addEventListener('click', () => sendToTab({ action: 'pause' }));
+$('pauseBtn').addEventListener('click', () => sendCommand({ action: 'pause' }));
 
 $('stopBtn').addEventListener('click', async () => {
   try {
-    await sendToTab({ action: 'stop' });
+    await sendCommand({ action: 'stop' });
   } catch (e) {
     $('status').textContent = '⚠ ' + e.message;
   }
@@ -181,7 +223,7 @@ $('speedSlider').addEventListener('input', e => {
   const s = parseFloat(e.target.value);
   $('speedVal').textContent = s.toFixed(1);
   chrome.storage.sync.set({ speed: s });
-  sendToTab({ action: 'setSpeed', speed: s }).catch(() => {});
+  sendCommand({ action: 'setSpeed', speed: s }).catch(() => {});
 });
 
 // ── Settings ──

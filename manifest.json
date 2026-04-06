@@ -5,11 +5,13 @@
   "description": "Read Japanese articles aloud with word-level highlighting using Google Cloud TTS",
   "permissions": [
     "activeTab",
+    "offscreen",
     "scripting",
     "storage",
     "tabs"
   ],
   "host_permissions": [
+    "<all_urls>",
     "https://texttospeech.googleapis.com/*"
   ],
   "action": {
