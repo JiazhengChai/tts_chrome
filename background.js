@@ -7,6 +7,8 @@ const DETACHED_CONTROLLER_URL = chrome.runtime.getURL('popup.html?detached=1');
 const OFFSCREEN_DOCUMENT_URL = 'offscreen.html';
 const PDF_VIEWER_EXTENSION_ID = 'mhjfbmdgcfjbbpaeojofohoefgiehjai';
 const PDF_URL_RE = /\.pdf(?:$|[?#])/i;
+const PDF_CONTENT_TYPE_RE = /^application\/pdf\b/i;
+const TEXT_CONTENT_TYPE_RE = /^(?:text\/(?:plain|markdown|csv|tab-separated-values|xml)|application\/(?:json|xml|x-yaml|yaml))(?:;|$)/i;
 const TEXT_DOCUMENT_URL_RE = /\.(?:txt|text|md|markdown|csv|tsv|log|json|xml|ya?ml|ini|cfg|conf|srt|vtt)(?:$|[?#])/i;
 const PROVIDERS = {
   GOOGLE: 'google',
@@ -17,6 +19,7 @@ const DEFAULT_OPENAI_VOICE = 'alloy';
 
 let targetTabId = null;
 let targetFrameId = null;
+const sniffedDocumentCache = new Map();
 
 function describeReadableUrl(rawUrl) {
   if (typeof rawUrl !== 'string' || !rawUrl) {
@@ -54,10 +57,86 @@ function isSupportedUrl(url) {
   return Boolean(describeReadableUrl(url));
 }
 
+function describeReadableContentType(contentType, rawUrl) {
+  const value = (contentType || '').split(';', 1)[0].trim();
+  if (!value) {
+    return null;
+  }
+
+  if (PDF_CONTENT_TYPE_RE.test(value)) {
+    return { mode: 'document', documentType: 'pdf', sourceUrl: rawUrl };
+  }
+
+  if (TEXT_CONTENT_TYPE_RE.test(value)) {
+    return { mode: 'document', documentType: 'text', sourceUrl: rawUrl };
+  }
+
+  return null;
+}
+
+async function sniffReadableDocument(rawUrl) {
+  if (sniffedDocumentCache.has(rawUrl)) {
+    return sniffedDocumentCache.get(rawUrl);
+  }
+
+  let details = null;
+
+  try {
+    const url = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      sniffedDocumentCache.set(rawUrl, null);
+      return null;
+    }
+
+    const response = await fetch(rawUrl, {
+      method: 'HEAD',
+      credentials: 'include',
+      redirect: 'follow'
+    });
+
+    if (response.ok) {
+      details = describeReadableContentType(response.headers.get('content-type'), rawUrl);
+    }
+  } catch {
+    details = null;
+  }
+
+  sniffedDocumentCache.set(rawUrl, details);
+  return details;
+}
+
 function buildTargetDescriptor(tab, frameId = null) {
   const details = describeReadableUrl(tab?.url);
   if (!tab?.id || !details) {
     return null;
+  }
+
+  return {
+    tabId: tab.id,
+    frameId,
+    url: tab.url,
+    title: tab.title,
+    mode: details.mode,
+    documentType: details.documentType || null,
+    sourceUrl: details.sourceUrl || null
+  };
+}
+
+async function buildResolvedTargetDescriptor(tab, frameId = null) {
+  if (!tab?.id) {
+    return null;
+  }
+
+  let details = describeReadableUrl(tab.url);
+  if (!details) {
+    return null;
+  }
+
+  if (details.mode === 'content') {
+    const sniffed = await sniffReadableDocument(tab.url);
+    if (sniffed) {
+      details = sniffed;
+    }
   }
 
   return {
@@ -214,7 +293,7 @@ async function resolveTargetTab() {
   if (targetTabId) {
     try {
       const tab = await chrome.tabs.get(targetTabId);
-      const descriptor = buildTargetDescriptor(tab, targetFrameId);
+      const descriptor = await buildResolvedTargetDescriptor(tab, targetFrameId);
       if (descriptor) {
         return descriptor;
       }
@@ -225,12 +304,13 @@ async function resolveTargetTab() {
   }
 
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const fallback = tabs.find(tab => buildTargetDescriptor(tab));
-  if (fallback?.id) {
-    const descriptor = buildTargetDescriptor(fallback);
-    targetTabId = fallback.id;
-    targetFrameId = null;
-    return descriptor;
+  for (const tab of tabs) {
+    const descriptor = await buildResolvedTargetDescriptor(tab);
+    if (descriptor) {
+      targetTabId = tab.id;
+      targetFrameId = null;
+      return descriptor;
+    }
   }
 
   return null;
@@ -427,7 +507,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.action === 'documentReaderCommand') {
-    sendOffscreenCommand(msg.command, { target: msg.target, speed: msg.speed })
+    sendOffscreenCommand(msg.command, {
+      target: msg.target,
+      speed: msg.speed,
+      startWordIndex: msg.startWordIndex
+    })
       .then(sendResponse)
       .catch(e => sendResponse({ error: e.message }));
     return true;

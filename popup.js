@@ -55,6 +55,13 @@ const VOICE_OPTIONS = {
 };
 
 let activeProvider = PROVIDERS.GOOGLE;
+let currentTarget = null;
+let currentPreviewKey = null;
+let currentActiveWordIndex = null;
+let selectedDocumentWordIndex = null;
+let activeTokenSpan = null;
+let anchorTokenSpan = null;
+const tokenSpans = new Map();
 
 async function getSettings() {
   const response = await chrome.runtime.sendMessage({ action: 'getSettings' });
@@ -133,6 +140,164 @@ function syncProviderUi(data) {
   $('providerNote').hidden = activeProvider !== PROVIDERS.OPENAI;
 }
 
+function resetDocumentPreview() {
+  $('documentPanel').hidden = true;
+  $('documentPreview').replaceChildren();
+  $('documentPreview').classList.remove('empty');
+  currentPreviewKey = null;
+  currentActiveWordIndex = null;
+  selectedDocumentWordIndex = null;
+  activeTokenSpan = null;
+  anchorTokenSpan = null;
+  tokenSpans.clear();
+}
+
+function getTokenSpanFromNode(node) {
+  let current = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  while (current && current !== $('documentPreview')) {
+    if (current.dataset?.wordIndex) {
+      return current;
+    }
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function setAnchorWordIndex(wordIndex) {
+  if (anchorTokenSpan) {
+    anchorTokenSpan.classList.remove('anchor-token');
+  }
+
+  selectedDocumentWordIndex = Number.isInteger(wordIndex) ? wordIndex : null;
+  anchorTokenSpan = selectedDocumentWordIndex === null ? null : tokenSpans.get(selectedDocumentWordIndex) || null;
+  anchorTokenSpan?.classList.add('anchor-token');
+}
+
+function setActiveWordIndex(wordIndex, scrollIntoView = true) {
+  if (activeTokenSpan) {
+    activeTokenSpan.classList.remove('active-token');
+  }
+
+  currentActiveWordIndex = Number.isInteger(wordIndex) ? wordIndex : null;
+  activeTokenSpan = currentActiveWordIndex === null ? null : tokenSpans.get(currentActiveWordIndex) || null;
+
+  if (activeTokenSpan) {
+    activeTokenSpan.classList.add('active-token');
+    if (scrollIntoView) {
+      activeTokenSpan.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+}
+
+function updateDocumentSelectionFromDom() {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    return;
+  }
+
+  const range = selection.getRangeAt(0);
+  const startSpan = getTokenSpanFromNode(range.startContainer);
+  const endSpan = getTokenSpanFromNode(range.endContainer);
+  const indexes = [startSpan, endSpan]
+    .filter(Boolean)
+    .map(span => parseInt(span.dataset.wordIndex, 10))
+    .filter(Number.isFinite);
+
+  if (indexes.length) {
+    setAnchorWordIndex(Math.min(...indexes));
+  }
+}
+
+function renderDocumentPreview(preview) {
+  const previewEl = $('documentPreview');
+  const fragment = document.createDocumentFragment();
+
+  currentPreviewKey = preview.targetKey;
+  tokenSpans.clear();
+  activeTokenSpan = null;
+  anchorTokenSpan = null;
+
+  $('documentPanel').hidden = false;
+  $('documentLabel').textContent = preview.documentType === 'pdf' ? 'PDF Preview' : 'Document Preview';
+  $('documentHint').textContent = 'Select text below to start reading from that point. The active word highlights while audio plays.';
+
+  if (!preview.paragraphs?.length) {
+    previewEl.classList.add('empty');
+    previewEl.textContent = 'No preview available for this document.';
+    return;
+  }
+
+  previewEl.classList.remove('empty');
+  for (const paragraph of preview.paragraphs) {
+    const paragraphEl = document.createElement('p');
+
+    for (const token of paragraph) {
+      const tokenEl = document.createElement('span');
+      tokenEl.className = 'document-token';
+      tokenEl.textContent = token.text;
+      tokenEl.dataset.wordIndex = String(token.globalIndex);
+      paragraphEl.append(tokenEl);
+      tokenSpans.set(token.globalIndex, tokenEl);
+    }
+
+    fragment.append(paragraphEl);
+  }
+
+  previewEl.replaceChildren(fragment);
+  setAnchorWordIndex(selectedDocumentWordIndex);
+  setActiveWordIndex(currentActiveWordIndex, false);
+}
+
+async function loadDocumentPreview(target) {
+  if (target.mode !== 'document') {
+    resetDocumentPreview();
+    return;
+  }
+
+  const previewEl = $('documentPreview');
+  $('documentPanel').hidden = false;
+  $('documentLabel').textContent = target.documentType === 'pdf' ? 'PDF Preview' : 'Document Preview';
+  $('documentHint').textContent = 'Loading preview…';
+  previewEl.classList.add('empty');
+  previewEl.textContent = 'Loading preview…';
+
+  const preview = await sendDocumentCommand('getPreview', target);
+  if (preview?.error) {
+    throw new Error(preview.error);
+  }
+
+  renderDocumentPreview(preview);
+}
+
+function getSelectedDocumentStartWordIndex(target) {
+  if (target.mode !== 'document' || currentPreviewKey !== `${target.documentType || 'content'}|${target.sourceUrl || target.url || ''}`) {
+    return 0;
+  }
+
+  return Number.isInteger(selectedDocumentWordIndex) ? selectedDocumentWordIndex : 0;
+}
+
+$('documentPreview').addEventListener('mouseup', () => {
+  updateDocumentSelectionFromDom();
+});
+
+$('documentPreview').addEventListener('click', event => {
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed) {
+    return;
+  }
+
+  const tokenSpan = getTokenSpanFromNode(event.target);
+  if (!tokenSpan) {
+    return;
+  }
+
+  const wordIndex = parseInt(tokenSpan.dataset.wordIndex, 10);
+  if (Number.isFinite(wordIndex)) {
+    setAnchorWordIndex(wordIndex);
+  }
+});
+
 // ── Load saved settings ──
 
 getSettings().then(data => {
@@ -153,9 +318,20 @@ seedTargetTab().catch(() => {});
 (async () => {
   try {
     const target = await getTargetTab();
+    currentTarget = target;
     if (!target?.tabId) return;
+    if (target.mode === 'document') {
+      await loadDocumentPreview(target);
+    } else {
+      resetDocumentPreview();
+    }
     const state = await getReaderState(target);
-    if (state) updateButtons(state);
+    if (state) {
+      updateButtons(state);
+      if (target.mode === 'document') {
+        setActiveWordIndex(state.activeWordIndex ?? null, false);
+      }
+    }
   } catch (e) {
     $('status').textContent = '⚠ ' + e.message;
   }
@@ -302,8 +478,11 @@ $('readBtn').addEventListener('click', async () => {
 
   try {
     const target = await getTargetTab();
+    currentTarget = target;
     if (target.mode === 'document') {
-      const resp = await sendDocumentCommand('read', target);
+      const resp = await sendDocumentCommand('read', target, {
+        startWordIndex: getSelectedDocumentStartWordIndex(target)
+      });
       if (resp?.error) {
         throw new Error(resp.error);
       }
@@ -437,6 +616,13 @@ async function openPinnedController() {
 // ── Listen for status updates from content script ──
 
 chrome.runtime.onMessage.addListener(msg => {
+  if (msg.action === 'documentHighlightUpdate') {
+    if (msg.targetKey === currentPreviewKey) {
+      setActiveWordIndex(Number.isInteger(msg.activeWordIndex) ? msg.activeWordIndex : null);
+    }
+    return;
+  }
+
   if (msg.action !== 'statusUpdate') return;
 
   $('status').textContent = msg.message;
@@ -451,5 +637,6 @@ chrome.runtime.onMessage.addListener(msg => {
     $('pauseBtn').disabled = true;
     $('stopBtn').disabled  = true;
     $('pauseBtn').textContent = '⏸';
+    setActiveWordIndex(null, false);
   }
 });

@@ -53,7 +53,7 @@ You can use either provider:
 
 ### Notes
 
-- PDF and text-document reading does not provide in-page word highlighting because Chrome's PDF viewer and raw document tabs do not expose a normal DOM text layer to the content script.
+- PDF and text-document reading now exposes a text preview inside the popup or detached controller. Select text there to start from that point, and the active word highlights in the preview while audio plays. Chrome's built-in PDF viewer itself still does not expose a scriptable DOM text layer for true in-page highlighting.
 - OpenAI TTS-1 does not expose provider word timing marks. On webpages, the extension estimates timing locally so selection starts and word highlighting are approximate rather than exact.
 - Local `file://` PDFs or text files may require enabling **Allow access to file URLs** for the unpacked extension on `chrome://extensions/`.
 
